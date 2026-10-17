@@ -19,9 +19,13 @@ const ByteScanner = struct {
         };
     }
 
-    fn peek(self: *ByteScanner) DecodeError!u8 {
+    fn has_byte(self: *ByteScanner) bool {
+        return self.idx < self.src.len;
+    }
+
+    fn peek(self: *ByteScanner) ?u8 {
         if (self.idx >= self.src.len) {
-            return DecodeError.IncompleteInstruction;
+            return null;
         }
         return self.src[self.idx];
     }
@@ -47,8 +51,28 @@ const ByteScanner = struct {
 
 pub const Instruction = struct {
     type: InstructionType,
-    source: Register,
-    target: Register,
+    source: Location,
+    target: Location,
+};
+
+const Location = union(enum) {
+    register: Register,
+    immediate: SizedValue,
+    memory: SizedValue,
+
+    fn string_representation(self: Location) []const u8 {
+        std.debug.assert(self == .register);
+        switch (self) {
+            .register => |r| return r.string_representation(),
+            .immediate => unreachable,
+            .memory => unreachable,
+        }
+    }
+};
+
+const SizedValue = union(enum) {
+    byte: u8,
+    word: u16,
 };
 
 pub const InstructionType = enum {
@@ -112,10 +136,13 @@ pub fn decode_program(data: []const u8, writer: *Io.Writer) !void {
     var scanner: ByteScanner = .init(data);
 
     var instruction: Instruction = undefined;
-    try decode_instruction(&scanner, &instruction);
 
     try emit_preeamble(writer);
-    try emit_instruction(writer, &instruction);
+
+    while (scanner.peek()) |byte| {
+        try decode_instruction(byte, &scanner, &instruction);
+        try emit_instruction(writer, &instruction);
+    }
 }
 
 fn emit_preeamble(writer: *Io.Writer) !void {
@@ -130,10 +157,8 @@ fn emit_instruction(writer: *Io.Writer, instruction: *Instruction) !void {
     try writer.print("{s} {s}, {s}\n", .{ mnemonic, target, source });
 }
 
-fn decode_instruction(scanner: *ByteScanner, instruction: *Instruction) !void {
-    const first_byte: u8 = try scanner.peek();
-
-    switch (first_byte) {
+fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Instruction) !void {
+    switch (leading_byte) {
         0b10001000...0b10001011 => {
             instruction.type = .Mov;
             const bytes = try scanner.pop_n(2);
@@ -150,8 +175,6 @@ fn mask_bits(input: u8, mask: u8, right_shift: u3) u8 {
 }
 
 fn mov_register_to_register(bytes: *const [2]u8, instruction: *Instruction) void {
-    // std.debug.print("{b}\n", .{bytes[0]});
-    // std.debug.print("{b}\n", .{bytes[1]});
     const D_MASK = 0b0000_0010;
     const W_MASK = 0b0000_0001;
 
@@ -180,10 +203,10 @@ fn mov_register_to_register(bytes: *const [2]u8, instruction: *Instruction) void
     //std.debug.print("r_m: {any}, reg: {any}\n", .{ r_m_register, reg_register });
 
     if (d_unshifted > 0) {
-        instruction.source = r_m_register;
-        instruction.target = reg_register;
+        instruction.source = Location{ .register = r_m_register };
+        instruction.target = Location{ .register = reg_register };
     } else {
-        instruction.source = reg_register;
-        instruction.target = r_m_register;
+        instruction.source = Location{ .register = reg_register };
+        instruction.target = Location{ .register = r_m_register };
     }
 }
