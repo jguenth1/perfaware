@@ -4,6 +4,7 @@ const Io = std.Io;
 pub const DecodeError = error{
     /// Reached the end of buffer while decoding an instruction
     IncompleteInstruction,
+    /// Invalid OR Unimplemented OpCode
     UnrecognizedOpCode,
 };
 
@@ -16,7 +17,6 @@ pub fn decode_program(data: []const u8, writer: *Io.Writer) !void {
 
     while (scanner.peek()) |byte| {
         try decode_instruction(byte, &scanner, &instruction);
-        //std.debug.print("{any}\n", .{instruction});
         try instruction.emit(writer);
     }
 }
@@ -69,18 +69,23 @@ fn mov_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     }
 }
 
+fn set_source_target_by_flag(instruction: *Instruction, d: bool, reg: Location, other: Location) void {
+    if (d) {
+        instruction.source = other;
+        instruction.target = reg;
+    } else {
+        instruction.source = reg;
+        instruction.target = other;
+    }
+}
+
 fn mov_to_reg_from_reg(instruction: *Instruction, d: bool, w: bool, r_m: u8, reg: u8) void {
     const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    const r_m_register: Register = @fromBackingInt(r_m + register_offset);
-    const reg_register: Register = @fromBackingInt(reg + register_offset);
-
-    if (d) {
-        instruction.source = Location{ .register = r_m_register };
-        instruction.target = Location{ .register = reg_register };
-    } else {
-        instruction.source = Location{ .register = reg_register };
-        instruction.target = Location{ .register = r_m_register };
-    }
+    //const r_m_register: Register = @fromBackingInt(r_m + register_offset);
+    //const reg_register: Register = @fromBackingInt(reg + register_offset);
+    const r_m_location = Location{ .register = @fromBackingInt(r_m + register_offset) };
+    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
+    set_source_target_by_flag(instruction, d, reg_location, r_m_location);
 }
 
 fn mov_to_reg_from_mem_null_displacement(
@@ -92,28 +97,30 @@ fn mov_to_reg_from_mem_null_displacement(
     reg: u8,
 ) !void {
     const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    const reg_register: Register = @fromBackingInt(reg + register_offset);
+    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
 
-    var effective_address: EffectiveAddress = undefined;
+    var effective_address: Location = undefined;
+
+    // special case -- r/m 110 maps to direct address, not bp
     if (r_m == 0b110) {
-        const addr_bytes = try scanner.pop_n(2);
-        const addr: u16 = std.mem.readInt(u16, addr_bytes, .little);
-        effective_address = EffectiveAddress{ .direct_address = addr };
+        const addr: u16 = std.mem.readInt(u16, try scanner.pop_n(2), .little);
+        effective_address = Location{ .address = EffectiveAddress{ .direct_address = addr } };
     } else {
         const register: AddressingRegister = @fromBackingInt(r_m);
-        effective_address = EffectiveAddress{ .register = register };
+        effective_address = Location{ .address = EffectiveAddress{ .register = register } };
     }
 
-    if (d) {
-        instruction.source = Location{ .address = effective_address };
-        instruction.target = Location{ .register = reg_register };
-    } else {
-        instruction.source = Location{ .register = reg_register };
-        instruction.target = Location{ .address = effective_address };
-    }
+    set_source_target_by_flag(instruction, d, reg_location, effective_address);
 }
 
-pub const DisplacementSize = enum { byte, word };
+fn scan_byte_or_word(scanner: *ByteScanner, size: ValueSize) !SizedValue {
+    return switch (size) {
+        .byte => SizedValue{ .byte = try scanner.pop() },
+        .word => SizedValue{
+            .word = std.mem.readInt(u16, try scanner.pop_n(2), .little),
+        },
+    };
+}
 
 fn mov_to_reg_from_mem_with_displacement(
     scanner: *ByteScanner,
@@ -122,34 +129,21 @@ fn mov_to_reg_from_mem_with_displacement(
     w: bool,
     r_m: u8,
     reg: u8,
-    size: DisplacementSize,
+    size: ValueSize,
 ) !void {
     const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    const reg_register: Register = @fromBackingInt(reg + register_offset);
+    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
 
     const register: AddressingRegister = @fromBackingInt(r_m);
-
-    const displacement = switch (size) {
-        .byte => SizedValue{ .byte = try scanner.pop() },
-        .word => block: {
-            const bytes = try scanner.pop_n(2);
-            const value = std.mem.readInt(u16, bytes, .little);
-            break :block SizedValue{ .word = value };
-        },
+    const displacement = try scan_byte_or_word(scanner, size);
+    const effective_address = Location{
+        .address = EffectiveAddress{ .register_displacement = .{
+            .register = register,
+            .displacement = displacement,
+        } },
     };
 
-    const effective_address = EffectiveAddress{ .register_displacement = .{
-        .register = register,
-        .displacement = displacement,
-    } };
-
-    if (d) {
-        instruction.source = Location{ .address = effective_address };
-        instruction.target = Location{ .register = reg_register };
-    } else {
-        instruction.source = Location{ .register = reg_register };
-        instruction.target = Location{ .address = effective_address };
-    }
+    set_source_target_by_flag(instruction, d, reg_location, effective_address);
 }
 
 fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
@@ -157,21 +151,17 @@ fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     const W_MASK = 0b0000_1000;
     const w: bool = leading_byte & W_MASK > 0;
 
-    const reg = mask_bits(leading_byte, 0b111, 0);
+    const REG_MASK = 0b111;
+    const REG_SHIFT = 0;
+    const reg = mask_bits(leading_byte, REG_MASK, REG_SHIFT);
+
     const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
     const reg_register: Register = @fromBackingInt(reg + register_offset);
+
+    const size: ValueSize = if (w) .word else .byte;
+    const immediate_value = try scan_byte_or_word(scanner, size);
+
     instruction.target = Location{ .register = reg_register };
-
-    var immediate_value: SizedValue = undefined;
-    if (w) {
-        const data_bytes = try scanner.pop_n(2);
-        const data: u16 = std.mem.readInt(u16, data_bytes, .little);
-        immediate_value = SizedValue{ .word = data };
-    } else {
-        const data = try scanner.pop();
-        immediate_value = SizedValue{ .byte = data };
-    }
-
     instruction.source = Location{ .immediate = immediate_value };
 }
 
@@ -185,19 +175,12 @@ pub const Instruction = struct {
     target: Location,
 
     fn emit(self: *Instruction, writer: *Io.Writer) !void {
-        //const instruction.type.string_representation();
-        //const source = instruction.source.string_representation();
-        //const target = instruction.target.string_representation();
-
         try self.type.emit(writer);
         try writer.print(" ", .{});
         try self.target.emit(writer);
         try writer.print(", ", .{});
         try self.source.emit(writer);
         try writer.print("\n", .{});
-
-        // TODO: remove this
-        try writer.flush();
     }
 };
 
@@ -215,7 +198,9 @@ const Location = union(enum) {
     }
 };
 
-const SizedValue = union(enum) {
+// TODO: come up with better names for these
+const ValueSize = enum { byte, word };
+const SizedValue = union(ValueSize) {
     byte: u8,
     word: u16,
 
@@ -344,6 +329,7 @@ pub const EffectiveAddress = union(enum) {
     }
 };
 
+/// Convenience functions for handling encoded instructions
 const ByteScanner = struct {
     src: []const u8,
     idx: u32,
@@ -353,10 +339,6 @@ const ByteScanner = struct {
             .src = src,
             .idx = 0,
         };
-    }
-
-    fn has_byte(self: *ByteScanner) bool {
-        return self.idx < self.src.len;
     }
 
     fn peek(self: *ByteScanner) ?u8 {
@@ -375,6 +357,9 @@ const ByteScanner = struct {
         return res;
     }
 
+    /// How many bytes we're popping is basically always known at comptime.
+    /// Using a comptime-sized return value for this function allows us to catch
+    /// some out-of-bounds issues at compile time.
     fn pop_n(self: *ByteScanner, comptime n: u32) DecodeError!*const [n]u8 {
         if (self.idx + n - 1 >= self.src.len) {
             return DecodeError.IncompleteInstruction;
