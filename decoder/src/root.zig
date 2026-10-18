@@ -18,14 +18,30 @@ pub fn decode_program(data: []const u8, writer: *Io.Writer) !void {
     while (scanner.peek()) |byte| {
         try decode_instruction(byte, &scanner, &instruction);
         try instruction.emit(writer);
+        try writer.flush();
     }
 }
 
 fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Instruction) !void {
     switch (leading_byte) {
+        0b0111_0000...0b0111_1111 => {
+            const lookup_index = leading_byte & 0b1111;
+            instruction.type = @fromBackingInt(lookup_index + JUMP_INSTRUCTION_OFFSET);
+            try read_label(scanner, instruction);
+        },
+        0b1110_0000...0b1110_1111 => {
+            instruction.type = switch (leading_byte & 0b1111) {
+                0b0000 => .loopnz,
+                0b0001 => .loopz,
+                0b0010 => .loop,
+                0b0011 => .jcxz,
+                else => unreachable,
+            };
+            try read_label(scanner, instruction);
+        },
         0b100010_00...0b100010_11 => {
             instruction.type = .mov;
-            try mov_to_reg(scanner, instruction);
+            try reg_mem_to_reg(scanner, instruction);
         },
         0b1011_0000...0b1011_1111 => {
             instruction.type = .mov;
@@ -33,11 +49,38 @@ fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Ins
         },
         0b1100011_0...0b1100011_1 => {
             instruction.type = .mov;
-            try mov_imm_to_mem(scanner, instruction);
+            try mov_imm_to_effective_address(scanner, instruction);
         },
         0b101000_00...0b101000_11 => {
             instruction.type = .mov;
-            try mov_to_from_acc(scanner, instruction);
+            try mem_to_from_acc(scanner, instruction);
+        },
+        0b000000_00...0b000000_11 => {
+            instruction.type = .add;
+            try reg_mem_to_reg(scanner, instruction);
+        },
+        0b0000010_0...0b0000010_1 => {
+            instruction.type = .add;
+            try imm_to_acc(scanner, instruction);
+        },
+        0b100000_00...0b100000_11 => {
+            try arith_imm_to_reg_addr(scanner, instruction);
+        },
+        0b001010_00...0b001010_11 => {
+            instruction.type = .sub;
+            try reg_mem_to_reg(scanner, instruction);
+        },
+        0b0010110_0...0b0010110_1 => {
+            instruction.type = .sub;
+            try imm_to_acc(scanner, instruction);
+        },
+        0b001110_00...0b001110_11 => {
+            instruction.type = .cmp;
+            try reg_mem_to_reg(scanner, instruction);
+        },
+        0b0011110_0...0b0011110_1 => {
+            instruction.type = .cmp;
+            try imm_to_acc(scanner, instruction);
         },
         else => {
             return DecodeError.UnrecognizedOpCode;
@@ -45,10 +88,42 @@ fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Ins
     }
 }
 
+fn decode_jmp_mnemonic(byte: u8, instruction: *Instruction) void {
+    instruction.type = switch (byte & 0b1111) {
+        0b0000 => .jo,
+        0b0001 => .jno,
+        0b0010 => .jb,
+        0b0011 => .jnb,
+        0b0100 => .je,
+        0b0101 => .jnz,
+        0b0110 => .jbe,
+        0b0111 => .ja,
+        0b1000 => .js,
+        0b1001 => .jns,
+        0b1010 => .jp,
+        0b1011 => .jnp,
+        0b1100 => .jl,
+        0b1101 => .jnl,
+        0b1110 => .jle,
+        0b1111 => .jg,
+        else => unreachable,
+    };
+}
+
+fn read_label(scanner: *ByteScanner, instruction: *Instruction) !void {
+    _ = try scanner.pop();
+
+    const label = try scan_byte_or_word(scanner, .byte);
+    instruction.target = Location{
+        .immediate = label,
+    };
+}
+
 fn mask_bits(input: u8, mask: u8, right_shift: u3) u8 {
     return (input & mask) >> right_shift;
 }
 
+// TODO: replace this with a packed struct?
 fn scan_mod_reg_r_m(byte: u8) struct { u8, u8, u8 } {
     const R_M_MASK = 0b0000_0111;
     const R_M_SHIFT = 0;
@@ -64,7 +139,7 @@ fn scan_mod_reg_r_m(byte: u8) struct { u8, u8, u8 } {
     };
 }
 
-fn mov_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
+fn reg_mem_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     const bytes = try scanner.pop_n(2);
     const D_MASK = 0b0000_0010;
     const W_MASK = 0b0000_0001;
@@ -123,7 +198,6 @@ fn displaced_effective_address(scanner: *ByteScanner, r_m: u8, size: ValueSize) 
 }
 
 fn effective_address(scanner: *ByteScanner, mod: u8, r_m: u8) !Location {
-    std.debug.assert(mod != 0b11);
     switch (mod) {
         0b00 => {
             // special case -- r/m 110 maps to direct address, not bp
@@ -150,11 +224,41 @@ fn scan_byte_or_word(scanner: *ByteScanner, size: ValueSize) !SizedValue {
     };
 }
 
-fn mov_imm_to_mem(scanner: *ByteScanner, instruction: *Instruction) !void {
+fn arith_imm_to_reg_addr(scanner: *ByteScanner, instruction: *Instruction) !void {
+    const bytes = try scanner.pop_n(2);
+
+    const s = (bytes[0] & 0b10) > 0;
+    const w = (bytes[0] & 0b01) > 0;
+
+    const mod, const reg, const r_m = scan_mod_reg_r_m(bytes[1]);
+    instruction.type = switch (reg) {
+        0b000 => .add,
+        0b101 => .sub,
+        0b111 => .cmp,
+        else => unreachable,
+    };
+
+    if (mod == 0b11) {
+        const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
+        instruction.target = Location{
+            .register = @fromBackingInt(r_m + register_offset),
+        };
+    } else {
+        instruction.target = try effective_address(scanner, mod, r_m);
+    }
+
+    const size: ValueSize = if (w and !s) .word else .byte;
+    const immediate = try scan_byte_or_word(scanner, size);
+
+    instruction.source = Location{ .immediate = immediate };
+}
+
+fn mov_imm_to_effective_address(scanner: *ByteScanner, instruction: *Instruction) !void {
     const bytes = try scanner.pop_n(2);
 
     const mod, const reg, const r_m = scan_mod_reg_r_m(bytes[1]);
-    std.debug.assert(reg == 0b000); // this opcode should always reg as 000
+
+    std.debug.assert(reg == 0b000);
     instruction.target = try effective_address(scanner, mod, r_m);
 
     const w = (bytes[0] & 0b1) > 0;
@@ -182,7 +286,19 @@ fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     instruction.source = Location{ .immediate = immediate_value };
 }
 
-fn mov_to_from_acc(scanner: *ByteScanner, instruction: *Instruction) !void {
+fn imm_to_acc(scanner: *ByteScanner, instruction: *Instruction) !void {
+    const leading_byte = try scanner.pop();
+    const w = (leading_byte & 0b1) > 0;
+
+    const imm = try scan_byte_or_word(scanner, if (w) .word else .byte);
+
+    const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
+    const register: Register = @fromBackingInt(@backingInt(Register.al) + register_offset);
+    instruction.target = Location{ .register = register };
+    instruction.source = Location{ .immediate = imm };
+}
+
+fn mem_to_from_acc(scanner: *ByteScanner, instruction: *Instruction) !void {
     const leading_byte = try scanner.pop();
     const D_MASK = 0b10;
     const W_MASK = 0b1;
@@ -216,6 +332,11 @@ pub const Instruction = struct {
     fn emit(self: *Instruction, writer: *Io.Writer) !void {
         try writer.print("{s} ", .{self.type.string_representation()});
         try self.target.emit(writer);
+        if (self.type.is_single_operand()) {
+            try writer.print("\n", .{});
+            return;
+        }
+
         try writer.print(", ", .{});
 
         // special case - need to include size annotation when it's not inferred
@@ -264,19 +385,76 @@ const SizedValue = union(ValueSize) {
     }
 };
 
-pub const InstructionType = enum {
-    mov,
+pub const InstructionType = enum(u8) {
+    mov = 0,
+    add,
+    sub,
+    cmp,
+
+    // start of single operand instructions
+    loopnz,
+    loopz,
+    loop,
+    jcxz,
+    // Start Jump instructions
+    jo,
+    jno,
+    jb,
+    jnb,
+    je,
+    jnz,
+    jbe,
+    ja,
+    js,
+    jns,
+    jp,
+    jnp,
+    jl,
+    jnl,
+    jle,
+    jg,
 
     fn emit(self: InstructionType, writer: *Io.Writer) !void {
         try writer.print("{s}", .{self.string_representation()});
     }
 
+    fn is_single_operand(self: InstructionType) bool {
+        return @backingInt(self) >= SINGLE_OPERAND_OFFSET;
+    }
+
     fn string_representation(self: InstructionType) []const u8 {
         return switch (self) {
             .mov => "mov",
+            .add => "add",
+            .sub => "sub",
+            .cmp => "cmp",
+            .jcxz => "jcxz",
+            .loop => "loop",
+            .loopz => "loopz",
+            .loopnz => "loopnz",
+            .jo => "jo",
+            .jno => "jno",
+            .jb => "jb",
+            .jnb => "jnb",
+            .je => "je",
+            .jnz => "jnz",
+            .jbe => "jbe",
+            .ja => "ja",
+            .js => "js",
+            .jns => "jns",
+            .jp => "jp",
+            .jnp => "jnp",
+            .jl => "jl",
+            .jnl => "jnl",
+            .jle => "jle",
+            .jg => "jg",
         };
     }
 };
+
+const SINGLE_OPERAND_OFFSET = @backingInt(InstructionType.loopnz);
+const LOOP_INSTRUCTION_OFFSET = @backingInt(InstructionType.loopnz);
+const JUMP_INSTRUCTION_OFFSET = @backingInt(InstructionType.jo);
 
 pub const Register = enum(u8) {
     // Byte registers
@@ -371,14 +549,12 @@ pub const EffectiveAddress = union(enum) {
             .register => |r| try writer.print("[{s}]", .{r.string_representation()}),
             .register_displacement => |r_d| {
                 const register = r_d.register.string_representation();
-                //const displacement: u16 = switch (r_d.displacement) {
-                //    .byte => |b| @as(u16, b),
-                //    .word => |w| w,
-                //};
-                if (r_d.displacement > 0) {
-                    try writer.print("[{s} + {d}]", .{ register, r_d.displacement });
-                } else {
+                if (r_d.displacement == 0) {
+                    try writer.print("[{s}]", .{register});
+                } else if (r_d.displacement < 0) {
                     try writer.print("[{s} - {d}]", .{ register, -r_d.displacement });
+                } else {
+                    try writer.print("[{s} + {d}]", .{ register, r_d.displacement });
                 }
             },
         }
