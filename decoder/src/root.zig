@@ -23,13 +23,21 @@ pub fn decode_program(data: []const u8, writer: *Io.Writer) !void {
 
 fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Instruction) !void {
     switch (leading_byte) {
-        0b1000_1000...0b1000_1011 => {
-            instruction.type = .Mov;
+        0b100010_00...0b100010_11 => {
+            instruction.type = .mov;
             try mov_to_reg(scanner, instruction);
         },
         0b1011_0000...0b1011_1111 => {
-            instruction.type = .Mov;
+            instruction.type = .mov;
             try mov_imm_to_reg(scanner, instruction);
+        },
+        0b1100011_0...0b1100011_1 => {
+            instruction.type = .mov;
+            try mov_imm_to_mem(scanner, instruction);
+        },
+        0b101000_00...0b101000_11 => {
+            instruction.type = .mov;
+            try mov_to_from_acc(scanner, instruction);
         },
         else => {
             return DecodeError.UnrecognizedOpCode;
@@ -41,6 +49,21 @@ fn mask_bits(input: u8, mask: u8, right_shift: u3) u8 {
     return (input & mask) >> right_shift;
 }
 
+fn scan_mod_reg_r_m(byte: u8) struct { u8, u8, u8 } {
+    const R_M_MASK = 0b0000_0111;
+    const R_M_SHIFT = 0;
+    const REG_MASK = 0b0011_1000;
+    const REG_SHIFT = 3;
+    const MOD_MASK = 0b1100_0000;
+    const MOD_SHIFT = 6;
+
+    return .{
+        mask_bits(byte, MOD_MASK, MOD_SHIFT),
+        mask_bits(byte, REG_MASK, REG_SHIFT),
+        mask_bits(byte, R_M_MASK, R_M_SHIFT),
+    };
+}
+
 fn mov_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     const bytes = try scanner.pop_n(2);
     const D_MASK = 0b0000_0010;
@@ -49,22 +72,22 @@ fn mov_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     const d: bool = (bytes[0] & D_MASK) > 0;
     const w: bool = (bytes[0] & W_MASK) > 0;
 
-    const R_M_MASK = 0b0000_0111;
-    const R_M_SHIFT = 0;
-    const REG_MASK = 0b0011_1000;
-    const REG_SHIFT = 3;
-    const MOD_MASK = 0b1100_0000;
-    const MOD_SHIFT = 6;
-
-    const r_m = mask_bits(bytes[1], R_M_MASK, R_M_SHIFT);
-    const reg = mask_bits(bytes[1], REG_MASK, REG_SHIFT);
-    const mod = mask_bits(bytes[1], MOD_MASK, MOD_SHIFT);
+    const mod, const reg, const r_m = scan_mod_reg_r_m(bytes[1]);
 
     switch (mod) {
-        0b11 => mov_to_reg_from_reg(instruction, d, w, r_m, reg),
-        0b00 => try mov_to_reg_from_mem_null_displacement(scanner, instruction, d, w, r_m, reg),
-        0b01 => try mov_to_reg_from_mem_with_displacement(scanner, instruction, d, w, r_m, reg, .byte),
-        0b10 => try mov_to_reg_from_mem_with_displacement(scanner, instruction, d, w, r_m, reg, .word),
+        0b00...0b10 => {
+            const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
+            const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
+
+            const eff_addr = try effective_address(scanner, mod, r_m);
+            set_source_target_by_flag(instruction, d, reg_location, eff_addr);
+        },
+        0b11 => {
+            const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
+            const r_m_location = Location{ .register = @fromBackingInt(r_m + register_offset) };
+            const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
+            set_source_target_by_flag(instruction, d, reg_location, r_m_location);
+        },
         else => unreachable,
     }
 }
@@ -79,38 +102,43 @@ fn set_source_target_by_flag(instruction: *Instruction, d: bool, reg: Location, 
     }
 }
 
-fn mov_to_reg_from_reg(instruction: *Instruction, d: bool, w: bool, r_m: u8, reg: u8) void {
-    const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    //const r_m_register: Register = @fromBackingInt(r_m + register_offset);
-    //const reg_register: Register = @fromBackingInt(reg + register_offset);
-    const r_m_location = Location{ .register = @fromBackingInt(r_m + register_offset) };
-    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
-    set_source_target_by_flag(instruction, d, reg_location, r_m_location);
+fn displaced_effective_address(scanner: *ByteScanner, r_m: u8, size: ValueSize) !Location {
+    const register: AddressingRegister = @fromBackingInt(r_m);
+    const sized_displacement = try scan_byte_or_word(scanner, size);
+
+    const displacement: i16 = switch (sized_displacement) {
+        // bitwise cast u8 -> i8, sign-extend i8 -> i16
+        .byte => |b| @as(i16, @as(i8, @bitCast(b))),
+        .word => |w| @bitCast(w),
+    };
+
+    return Location{
+        .address = EffectiveAddress{
+            .register_displacement = .{
+                .register = register,
+                .displacement = displacement,
+            },
+        },
+    };
 }
 
-fn mov_to_reg_from_mem_null_displacement(
-    scanner: *ByteScanner,
-    instruction: *Instruction,
-    d: bool,
-    w: bool,
-    r_m: u8,
-    reg: u8,
-) !void {
-    const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
-
-    var effective_address: Location = undefined;
-
-    // special case -- r/m 110 maps to direct address, not bp
-    if (r_m == 0b110) {
-        const addr: u16 = std.mem.readInt(u16, try scanner.pop_n(2), .little);
-        effective_address = Location{ .address = EffectiveAddress{ .direct_address = addr } };
-    } else {
-        const register: AddressingRegister = @fromBackingInt(r_m);
-        effective_address = Location{ .address = EffectiveAddress{ .register = register } };
+fn effective_address(scanner: *ByteScanner, mod: u8, r_m: u8) !Location {
+    std.debug.assert(mod != 0b11);
+    switch (mod) {
+        0b00 => {
+            // special case -- r/m 110 maps to direct address, not bp
+            if (r_m == 0b110) {
+                const addr: u16 = std.mem.readInt(u16, try scanner.pop_n(2), .little);
+                return Location{ .address = EffectiveAddress{ .direct_address = addr } };
+            } else {
+                const register: AddressingRegister = @fromBackingInt(r_m);
+                return Location{ .address = EffectiveAddress{ .register = register } };
+            }
+        },
+        0b01 => return try displaced_effective_address(scanner, r_m, .byte),
+        0b10 => return try displaced_effective_address(scanner, r_m, .word),
+        else => unreachable,
     }
-
-    set_source_target_by_flag(instruction, d, reg_location, effective_address);
 }
 
 fn scan_byte_or_word(scanner: *ByteScanner, size: ValueSize) !SizedValue {
@@ -122,28 +150,17 @@ fn scan_byte_or_word(scanner: *ByteScanner, size: ValueSize) !SizedValue {
     };
 }
 
-fn mov_to_reg_from_mem_with_displacement(
-    scanner: *ByteScanner,
-    instruction: *Instruction,
-    d: bool,
-    w: bool,
-    r_m: u8,
-    reg: u8,
-    size: ValueSize,
-) !void {
-    const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
-    const reg_location = Location{ .register = @fromBackingInt(reg + register_offset) };
+fn mov_imm_to_mem(scanner: *ByteScanner, instruction: *Instruction) !void {
+    const bytes = try scanner.pop_n(2);
 
-    const register: AddressingRegister = @fromBackingInt(r_m);
-    const displacement = try scan_byte_or_word(scanner, size);
-    const effective_address = Location{
-        .address = EffectiveAddress{ .register_displacement = .{
-            .register = register,
-            .displacement = displacement,
-        } },
-    };
+    const mod, const reg, const r_m = scan_mod_reg_r_m(bytes[1]);
+    std.debug.assert(reg == 0b000); // this opcode should always reg as 000
+    instruction.target = try effective_address(scanner, mod, r_m);
 
-    set_source_target_by_flag(instruction, d, reg_location, effective_address);
+    const w = (bytes[0] & 0b1) > 0;
+    const size: ValueSize = if (w) .word else .byte;
+    const immediate = try scan_byte_or_word(scanner, size);
+    instruction.source = Location{ .immediate = immediate };
 }
 
 fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
@@ -165,6 +182,28 @@ fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     instruction.source = Location{ .immediate = immediate_value };
 }
 
+fn mov_to_from_acc(scanner: *ByteScanner, instruction: *Instruction) !void {
+    const leading_byte = try scanner.pop();
+    const D_MASK = 0b10;
+    const W_MASK = 0b1;
+    const d = (leading_byte & D_MASK) > 0;
+    const w = (leading_byte & W_MASK) > 0;
+
+    const addr_bytes = try scanner.pop_n(2);
+    const addr = std.mem.readInt(u16, addr_bytes, .little);
+    const mem = Location{
+        .address = EffectiveAddress{
+            .direct_address = addr,
+        },
+    };
+
+    const acc = Location{
+        .register = if (w) .ax else .al,
+    };
+
+    set_source_target_by_flag(instruction, d, mem, acc);
+}
+
 fn emit_preeamble(writer: *Io.Writer) !void {
     try writer.print("bits 16\n\n", .{});
 }
@@ -175,11 +214,17 @@ pub const Instruction = struct {
     target: Location,
 
     fn emit(self: *Instruction, writer: *Io.Writer) !void {
-        try self.type.emit(writer);
-        try writer.print(" ", .{});
+        try writer.print("{s} ", .{self.type.string_representation()});
         try self.target.emit(writer);
         try writer.print(", ", .{});
-        try self.source.emit(writer);
+
+        // special case - need to include size annotation when it's not inferred
+        if (self.source == .immediate and self.target == .address) {
+            const immediate = self.source.immediate;
+            try immediate.emit_with_size(writer);
+        } else {
+            try self.source.emit(writer);
+        }
         try writer.print("\n", .{});
     }
 };
@@ -210,10 +255,17 @@ const SizedValue = union(ValueSize) {
             .word => |w| try writer.print("{d}", .{w}),
         }
     }
+
+    fn emit_with_size(self: SizedValue, writer: *Io.Writer) !void {
+        switch (self) {
+            .byte => |b| try writer.print("byte {d}", .{b}),
+            .word => |w| try writer.print("word {d}", .{w}),
+        }
+    }
 };
 
 pub const InstructionType = enum {
-    Mov,
+    mov,
 
     fn emit(self: InstructionType, writer: *Io.Writer) !void {
         try writer.print("{s}", .{self.string_representation()});
@@ -221,7 +273,7 @@ pub const InstructionType = enum {
 
     fn string_representation(self: InstructionType) []const u8 {
         return switch (self) {
-            .Mov => "mov",
+            .mov => "mov",
         };
     }
 };
@@ -310,7 +362,7 @@ pub const EffectiveAddress = union(enum) {
     register: AddressingRegister,
     register_displacement: struct {
         register: AddressingRegister,
-        displacement: SizedValue,
+        displacement: i16,
     },
 
     fn emit(self: EffectiveAddress, writer: *Io.Writer) !void {
@@ -319,11 +371,15 @@ pub const EffectiveAddress = union(enum) {
             .register => |r| try writer.print("[{s}]", .{r.string_representation()}),
             .register_displacement => |r_d| {
                 const register = r_d.register.string_representation();
-                const displacement: u16 = switch (r_d.displacement) {
-                    .byte => |b| @as(u16, b),
-                    .word => |w| w,
-                };
-                try writer.print("[{s} + {d}]", .{ register, displacement });
+                //const displacement: u16 = switch (r_d.displacement) {
+                //    .byte => |b| @as(u16, b),
+                //    .word => |w| w,
+                //};
+                if (r_d.displacement > 0) {
+                    try writer.print("[{s} + {d}]", .{ register, r_d.displacement });
+                } else {
+                    try writer.print("[{s} - {d}]", .{ register, -r_d.displacement });
+                }
             },
         }
     }
