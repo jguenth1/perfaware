@@ -30,13 +30,8 @@ fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Ins
             try read_label(scanner, instruction);
         },
         0b1110_0000...0b1110_1111 => {
-            instruction.type = switch (leading_byte & 0b1111) {
-                0b0000 => .loopnz,
-                0b0001 => .loopz,
-                0b0010 => .loop,
-                0b0011 => .jcxz,
-                else => unreachable,
-            };
+            const lookup_index = leading_byte & 0b11;
+            instruction.type = @fromBackingInt(lookup_index + LOOP_INSTRUCTION_OFFSET);
             try read_label(scanner, instruction);
         },
         0b100010_00...0b100010_11 => {
@@ -86,28 +81,6 @@ fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Ins
             return DecodeError.UnrecognizedOpCode;
         },
     }
-}
-
-fn decode_jmp_mnemonic(byte: u8, instruction: *Instruction) void {
-    instruction.type = switch (byte & 0b1111) {
-        0b0000 => .jo,
-        0b0001 => .jno,
-        0b0010 => .jb,
-        0b0011 => .jnb,
-        0b0100 => .je,
-        0b0101 => .jnz,
-        0b0110 => .jbe,
-        0b0111 => .ja,
-        0b1000 => .js,
-        0b1001 => .jns,
-        0b1010 => .jp,
-        0b1011 => .jnp,
-        0b1100 => .jl,
-        0b1101 => .jnl,
-        0b1110 => .jle,
-        0b1111 => .jg,
-        else => unreachable,
-    };
 }
 
 fn read_label(scanner: *ByteScanner, instruction: *Instruction) !void {
