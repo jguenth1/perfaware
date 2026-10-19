@@ -8,21 +8,7 @@ pub const DecodeError = error{
     UnrecognizedOpCode,
 };
 
-pub fn decode_program(data: []const u8, writer: *Io.Writer) !void {
-    var scanner: ByteScanner = .init(data);
-
-    var instruction: Instruction = undefined;
-
-    try emit_preeamble(writer);
-
-    while (scanner.peek()) |byte| {
-        try decode_instruction(byte, &scanner, &instruction);
-        try instruction.emit(writer);
-        try writer.flush();
-    }
-}
-
-fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Instruction) !void {
+pub fn decode_instruction(leading_byte: u8, scanner: *ByteScanner, instruction: *Instruction) !void {
     switch (leading_byte) {
         0b0111_0000...0b0111_1111 => {
             const lookup_index = leading_byte & 0b1111;
@@ -150,7 +136,7 @@ fn set_source_target_by_flag(instruction: *Instruction, d: bool, reg: Location, 
     }
 }
 
-fn displaced_effective_address(scanner: *ByteScanner, r_m: u8, size: ValueSize) !Location {
+fn displaced_effective_address(scanner: *ByteScanner, r_m: u8, size: RegisterSize) !Location {
     const register: AddressingRegister = @fromBackingInt(r_m);
     const sized_displacement = try scan_byte_or_word(scanner, size);
 
@@ -188,10 +174,10 @@ fn effective_address(scanner: *ByteScanner, mod: u8, r_m: u8) !Location {
     }
 }
 
-fn scan_byte_or_word(scanner: *ByteScanner, size: ValueSize) !SizedValue {
+fn scan_byte_or_word(scanner: *ByteScanner, size: RegisterSize) !Sized {
     return switch (size) {
-        .byte => SizedValue{ .byte = try scanner.pop() },
-        .word => SizedValue{
+        .byte => Sized{ .byte = try scanner.pop() },
+        .word => Sized{
             .word = std.mem.readInt(u16, try scanner.pop_n(2), .little),
         },
     };
@@ -220,7 +206,7 @@ fn arith_imm_to_reg_addr(scanner: *ByteScanner, instruction: *Instruction) !void
         instruction.target = try effective_address(scanner, mod, r_m);
     }
 
-    const size: ValueSize = if (w and !s) .word else .byte;
+    const size: RegisterSize = if (w and !s) .word else .byte;
     const immediate = try scan_byte_or_word(scanner, size);
 
     instruction.source = Location{ .immediate = immediate };
@@ -235,7 +221,7 @@ fn mov_imm_to_effective_address(scanner: *ByteScanner, instruction: *Instruction
     instruction.target = try effective_address(scanner, mod, r_m);
 
     const w = (bytes[0] & 0b1) > 0;
-    const size: ValueSize = if (w) .word else .byte;
+    const size: RegisterSize = if (w) .word else .byte;
     const immediate = try scan_byte_or_word(scanner, size);
     instruction.source = Location{ .immediate = immediate };
 }
@@ -252,7 +238,7 @@ fn mov_imm_to_reg(scanner: *ByteScanner, instruction: *Instruction) !void {
     const register_offset = if (w) WORD_REG_START else BYTE_REG_START;
     const reg_register: Register = @fromBackingInt(reg + register_offset);
 
-    const size: ValueSize = if (w) .word else .byte;
+    const size: RegisterSize = if (w) .word else .byte;
     const immediate_value = try scan_byte_or_word(scanner, size);
 
     instruction.target = Location{ .register = reg_register };
@@ -293,20 +279,15 @@ fn mem_to_from_acc(scanner: *ByteScanner, instruction: *Instruction) !void {
     set_source_target_by_flag(instruction, d, mem, acc);
 }
 
-fn emit_preeamble(writer: *Io.Writer) !void {
-    try writer.print("bits 16\n\n", .{});
-}
-
 pub const Instruction = struct {
     type: InstructionType,
     source: Location,
     target: Location,
 
-    fn emit(self: *Instruction, writer: *Io.Writer) !void {
+    pub fn emit(self: *Instruction, writer: *Io.Writer) !void {
         try writer.print("{s} ", .{self.type.string_representation()});
         try self.target.emit(writer);
         if (self.type.is_single_operand()) {
-            try writer.print("\n", .{});
             return;
         }
 
@@ -319,13 +300,12 @@ pub const Instruction = struct {
         } else {
             try self.source.emit(writer);
         }
-        try writer.print("\n", .{});
     }
 };
 
-const Location = union(enum) {
+pub const Location = union(enum) {
     register: Register,
-    immediate: SizedValue,
+    immediate: Sized,
     address: EffectiveAddress,
 
     fn emit(self: Location, writer: *Io.Writer) !void {
@@ -338,19 +318,19 @@ const Location = union(enum) {
 };
 
 // TODO: come up with better names for these
-const ValueSize = enum { byte, word };
-const SizedValue = union(ValueSize) {
+const RegisterSize = enum { byte, word };
+pub const Sized = union(RegisterSize) {
     byte: u8,
     word: u16,
 
-    fn emit(self: SizedValue, writer: *Io.Writer) !void {
+    fn emit(self: Sized, writer: *Io.Writer) !void {
         switch (self) {
             .byte => |b| try writer.print("{d}", .{b}),
             .word => |w| try writer.print("{d}", .{w}),
         }
     }
 
-    fn emit_with_size(self: SizedValue, writer: *Io.Writer) !void {
+    fn emit_with_size(self: Sized, writer: *Io.Writer) !void {
         switch (self) {
             .byte => |b| try writer.print("byte {d}", .{b}),
             .word => |w| try writer.print("word {d}", .{w}),
@@ -429,6 +409,7 @@ const SINGLE_OPERAND_OFFSET = @backingInt(InstructionType.loopnz);
 const LOOP_INSTRUCTION_OFFSET = @backingInt(InstructionType.loopnz);
 const JUMP_INSTRUCTION_OFFSET = @backingInt(InstructionType.jo);
 
+pub const RegisterHalf = enum { low, high };
 pub const Register = enum(u8) {
     // Byte registers
     al = 0,
@@ -441,7 +422,7 @@ pub const Register = enum(u8) {
     bh,
 
     // Word (16 bit) register
-    ax = 128,
+    ax,
     cx,
     dx,
     bx,
@@ -450,11 +431,25 @@ pub const Register = enum(u8) {
     si,
     di,
 
-    fn emit(self: Register, writer: *Io.Writer) !void {
+    pub fn is_byte_width(self: Register) bool {
+        return @backingInt(self) < WORD_REG_START;
+    }
+
+    pub fn byte_register_half(self: Register) RegisterHalf {
+        std.debug.assert(self.is_byte_width());
+
+        return switch (self) {
+            .al, .bl, .cl, .dl => .low,
+            .ah, .bh, .ch, .dh => .high,
+            else => unreachable,
+        };
+    }
+
+    pub fn emit(self: Register, writer: *Io.Writer) !void {
         try writer.print("{s}", .{self.string_representation()});
     }
 
-    fn string_representation(self: Register) []const u8 {
+    pub fn string_representation(self: Register) []const u8 {
         return switch (self) {
             .al => "al",
             .cl => "cl",
@@ -464,7 +459,6 @@ pub const Register = enum(u8) {
             .ch => "ch",
             .dh => "dh",
             .bh => "bh",
-
             .ax => "ax",
             .cx => "cx",
             .dx => "dx",
@@ -477,8 +471,9 @@ pub const Register = enum(u8) {
     }
 };
 
-const BYTE_REG_START: u8 = @backingInt(Register.al);
-const WORD_REG_START: u8 = @backingInt(Register.ax);
+pub const BYTE_REG_START: u8 = @backingInt(Register.al);
+pub const WORD_REG_START: u8 = @backingInt(Register.ax);
+pub const REGISTER_COUNT: u8 = @typeInfo(Register).@"enum".field_values.len;
 
 pub const AddressingRegister = enum(u8) {
     bx_si = 0,
@@ -535,25 +530,26 @@ pub const EffectiveAddress = union(enum) {
 };
 
 /// Convenience functions for handling encoded instructions
-const ByteScanner = struct {
+pub const ByteScanner = struct {
     src: []const u8,
     idx: u32,
 
-    fn init(src: []const u8) ByteScanner {
+    pub fn init(src: []const u8) ByteScanner {
         return ByteScanner{
             .src = src,
             .idx = 0,
         };
     }
 
-    fn peek(self: *ByteScanner) ?u8 {
+    pub fn peek(self: *ByteScanner) ?u8 {
         if (self.idx >= self.src.len) {
             return null;
+        } else {
+            return self.src[self.idx];
         }
-        return self.src[self.idx];
     }
 
-    fn pop(self: *ByteScanner) DecodeError!u8 {
+    pub fn pop(self: *ByteScanner) DecodeError!u8 {
         if (self.idx >= self.src.len) {
             return DecodeError.IncompleteInstruction;
         }
@@ -565,7 +561,7 @@ const ByteScanner = struct {
     /// How many bytes we're popping is basically always known at comptime.
     /// Using a comptime-sized return value for this function allows us to catch
     /// some out-of-bounds issues at compile time.
-    fn pop_n(self: *ByteScanner, comptime n: u32) DecodeError!*const [n]u8 {
+    pub fn pop_n(self: *ByteScanner, comptime n: u32) DecodeError!*const [n]u8 {
         if (self.idx + n - 1 >= self.src.len) {
             return DecodeError.IncompleteInstruction;
         }

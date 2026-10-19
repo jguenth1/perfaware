@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const decoder = @import("decoder");
+const assembly = @import("assembly");
 
 fn read_entire_file(alloc: std.mem.Allocator, io: Io, file: []const u8) ![]u8 {
     const dir = Io.Dir.cwd();
@@ -27,7 +27,8 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
-    try decoder.decode_program(buf, stdout_writer);
+    //try decoder.disassemble_program(buf, stdout_writer);
+    try assembly.emulate_program(buf, stdout_writer);
 
     try stdout_writer.flush(); // Don't forget to flush!
 }
