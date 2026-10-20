@@ -37,13 +37,18 @@ pub fn emulate_program(raw_program: []const u8, writer: *Io.Writer) !void {
         try writer.print(" ;", .{});
 
         const register_snapshot = emulator.snapshot_registers(&executor);
-        emulator.execute_instruction(&executor, &instruction);
+        const flag_snapshot = executor.flags;
+        emulator.emulate_instruction(&executor, &instruction);
 
         try emulator.print_register_diffs(&executor, register_snapshot, writer);
+        try writer.print(" ", .{});
+        try emulator.print_flag_diffs(&executor, flag_snapshot, writer);
         try writer.print("\n", .{});
         try writer.flush();
     }
 
-    try writer.print("\nFinal registers:\n", .{});
+    try writer.print("\nRegisters:\n", .{});
     try executor.print_registers(writer);
+    try writer.print("Flags: ", .{});
+    try executor.print_flags(writer);
 }

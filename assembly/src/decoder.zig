@@ -318,7 +318,7 @@ pub const Location = union(enum) {
 };
 
 // TODO: come up with better names for these
-const RegisterSize = enum { byte, word };
+pub const RegisterSize = enum { byte, word };
 pub const Sized = union(RegisterSize) {
     byte: u8,
     word: u16,
@@ -335,6 +335,13 @@ pub const Sized = union(RegisterSize) {
             .byte => |b| try writer.print("byte {d}", .{b}),
             .word => |w| try writer.print("word {d}", .{w}),
         }
+    }
+
+    pub fn widen(self: Sized) u16 {
+        return switch (self) {
+            .word => |w| w,
+            .byte => |b| @as(u16, b),
+        };
     }
 };
 
@@ -376,32 +383,7 @@ pub const InstructionType = enum(u8) {
     }
 
     fn string_representation(self: InstructionType) []const u8 {
-        return switch (self) {
-            .mov => "mov",
-            .add => "add",
-            .sub => "sub",
-            .cmp => "cmp",
-            .jcxz => "jcxz",
-            .loop => "loop",
-            .loopz => "loopz",
-            .loopnz => "loopnz",
-            .jo => "jo",
-            .jno => "jno",
-            .jb => "jb",
-            .jnb => "jnb",
-            .je => "je",
-            .jnz => "jnz",
-            .jbe => "jbe",
-            .ja => "ja",
-            .js => "js",
-            .jns => "jns",
-            .jp => "jp",
-            .jnp => "jnp",
-            .jl => "jl",
-            .jnl => "jnl",
-            .jle => "jle",
-            .jg => "jg",
-        };
+        return @tagName(self);
     }
 };
 
@@ -435,6 +417,7 @@ pub const Register = enum(u8) {
         return @backingInt(self) < WORD_REG_START;
     }
 
+    /// only call this on byte addressable registers (al/ah, etc.)
     pub fn byte_register_half(self: Register) RegisterHalf {
         std.debug.assert(self.is_byte_width());
 
@@ -450,24 +433,7 @@ pub const Register = enum(u8) {
     }
 
     pub fn string_representation(self: Register) []const u8 {
-        return switch (self) {
-            .al => "al",
-            .cl => "cl",
-            .dl => "dl",
-            .bl => "bl",
-            .ah => "ah",
-            .ch => "ch",
-            .dh => "dh",
-            .bh => "bh",
-            .ax => "ax",
-            .cx => "cx",
-            .dx => "dx",
-            .bx => "bx",
-            .sp => "sp",
-            .bp => "bp",
-            .si => "si",
-            .di => "di",
-        };
+        return @tagName(self);
     }
 };
 
